@@ -1,0 +1,25 @@
+# Environment & sensitive variables
+.env
+.env.*
+
+# Telegram Pyrogram Session files
+*.session
+*.session-journal
+
+# Temporary download files & media
+downloads/
+temp/
+*.mp3
+*.jpg
+*.jpeg
+*.png
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.idea/
+.vscode/

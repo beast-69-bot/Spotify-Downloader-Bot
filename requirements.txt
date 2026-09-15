@@ -3,3 +3,4 @@ TgCrypto
 requests
 bs4
 motor
+python-dotenv

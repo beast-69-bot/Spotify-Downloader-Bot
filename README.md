@@ -31,7 +31,7 @@ A Telegram bot that downloads Spotify tracks, playlists, and albums and sends th
 | `API_ID` | ✅ | Telegram App ID from [my.telegram.org](https://my.telegram.org) |
 | `API_HASH` | ✅ | Telegram App Hash from [my.telegram.org](https://my.telegram.org) |
 | `BOT_TOKEN` | ✅ | Bot token from [@BotFather](https://t.me/BotFather) |
-| `MONGO_URI` | ✅ | MongoDB connection string |
+| `MONGO_URI` | ❌ | MongoDB connection string (Optional — leave empty to run without DB) |
 | `DB_NAME` | ❌ | Database name (default: `spoti_music_bot`) |
 | `LOG_CHANNEL` | ❌ | Numeric ID of your private log channel (default: `0` = off) |
 | `DEV_URL` | ❌ | Your Telegram profile URL shown in the /start button |
