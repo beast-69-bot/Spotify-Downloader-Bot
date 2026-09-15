@@ -1,11 +1,12 @@
 import os
 import re
 import json
+import time
 import asyncio
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import pyrogram.errors
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters, idle
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
@@ -14,6 +15,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    BotCommand,
 )
 from pyrogram.enums import ParseMode, ButtonStyle
 
@@ -30,10 +32,10 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/134.0.0.0 Safari/537.36"
 )
-MAX_WORKERS = 5
 
+# Regex matching track, playlist, and album links (including localized intl-xx URLs)
 SPOTIFY_RE = re.compile(
-    r"https?://open\.spotify\.com/(track|playlist|album)/[A-Za-z0-9]+"
+    r"https?://(?:open\.)?spotify\.(?:com|link)/(?:intl-[a-zA-Z_-]+/)?(track|playlist|album)/([A-Za-z0-9]+)"
 )
 
 
@@ -58,7 +60,7 @@ def _make_session() -> requests.Session:
     r = s.get(SPOTI_BASE + "/en2", timeout=30)
     soup = BeautifulSoup(r.text, "html.parser")
     hidden = soup.find("input", {"type": "hidden", "name": re.compile(r"^_")})
-    s._csrf = {hidden["name"]: hidden["value"]}
+    s._csrf = {hidden["name"]: hidden["value"]} if hidden else {}
     return s
 
 
@@ -107,8 +109,7 @@ def _download_thumb(url: str, name: str):
 def _download_file(url: str, name: str) -> str:
     safe = re.sub(r'[\\/*?:"<>|]', "", name)[:100]
     path = os.path.join(DOWNLOAD_DIR, f"{safe}.mp3")
-    with requests.get(url, stream=True, timeout=120,
-                      headers={"User-Agent": UA}) as r:
+    with requests.get(url, stream=True, timeout=120, headers={"User-Agent": UA}) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for chunk in r.iter_content(128 * 1024):
@@ -152,7 +153,7 @@ def _fetch_one(s: requests.Session, form_data: dict, index: int, fallback_thumb:
             break
 
     if not href:
-        return index, name, title, artist, None, None, "no link found"
+        return index, name, title, artist, None, None, "no download link found"
 
     try:
         local_path = _download_file(href, name)
@@ -175,21 +176,35 @@ def spotify_get_track(spotify_url: str):
     return name, title, artist, local_path, thumb
 
 
-def spotify_get_playlist(spotify_url: str, on_result=None):
+def _fetch_playlist_forms(spotify_url: str):
     s = _make_session()
     html = _fetch_action(s, spotify_url)
     forms, fallback_thumb = _parse_forms(html)
-    total = len(forms)
+    return forms, fallback_thumb
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_fetch_one, s, form, i, fallback_thumb): i
-            for i, form in enumerate(forms)
-        }
-        for future in as_completed(futures):
-            index, name, title, artist, local_path, thumb, err = future.result()
-            if on_result:
-                on_result(index, total, name, title, artist, local_path, thumb, err)
+
+def _download_track_from_form(form_data: dict, index: int, fallback_thumb: str | None = None):
+    s = _make_session()
+    _, name, title, artist, local_path, thumb, err = _fetch_one(s, form_data, index - 1, fallback_thumb)
+    return name, title, artist, local_path, thumb, err
+
+
+def resolve_spotify_url(text: str) -> tuple[str, str] | None:
+    short_match = re.search(r"https?://(?:spotify\.link|spoti\.fi)/[A-Za-z0-9]+", text)
+    if short_match:
+        try:
+            r = requests.head(short_match.group(0), allow_redirects=True, timeout=10, headers={"User-Agent": UA})
+            text = r.url
+        except Exception:
+            pass
+
+    match = SPOTIFY_RE.search(text)
+    if not match:
+        return None
+    stype = match.group(1)
+    sid   = match.group(2)
+    normalized_url = f"https://open.spotify.com/{stype}/{sid}"
+    return stype, normalized_url
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -204,16 +219,6 @@ def cleanup(path: str):
 
 def user_tag(user) -> str:
     return f"@{user.username}" if user.username else f"<code>{user.id}</code>"
-
-
-def spotify_type(url: str) -> str:
-    if "/track/" in url:
-        return "track"
-    if "/playlist/" in url:
-        return "playlist"
-    if "/album/" in url:
-        return "album"
-    return "unknown"
 
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -284,9 +289,12 @@ async def cmd_start(bot: Client, msg: Message):
 
     await msg.reply_text(
         "<blockquote>\n"
-        "<b>Hey 👋</b>\n"
-        "<b>Send me a Spotify track or playlist link and I'll download it for you.</b>\n\n"
-        "<i>Just paste the link below.</i>\n"
+        "<b>Hey 👋 Welcome to Spotify Music Downloader Bot!</b>\n\n"
+        "<b>Send me any Spotify link and I'll download it for you:</b>\n"
+        "• 🎵 Single Track\n"
+        "• 📀 Album\n"
+        "• 📋 Playlist\n\n"
+        "<i>Just paste your Spotify link below to get started!</i>\n"
         "</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [
@@ -295,7 +303,67 @@ async def cmd_start(bot: Client, msg: Message):
             ],
             [
                 InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
+                InlineKeyboardButton("Help 📖", callback_data="help", style=ButtonStyle.PRIMARY),
             ],
+        ]),
+    )
+
+
+async def cmd_help(bot: Client, msg: Message):
+    text = (
+        "<blockquote>\n"
+        "📖 <b>Spotify Music Bot Help Guide</b>\n\n"
+        "<b>Supported Links:</b>\n"
+        "• 🎵 <b>Track:</b> <code>https://open.spotify.com/track/...</code>\n"
+        "• 📀 <b>Album:</b> <code>https://open.spotify.com/album/...</code>\n"
+        "• 📋 <b>Playlist:</b> <code>https://open.spotify.com/playlist/...</code>\n\n"
+        "<b>How to use:</b>\n"
+        "1. Open Spotify App or Web.\n"
+        "2. Copy the share link of any track, album, or playlist.\n"
+        "3. Send the link here. The bot will automatically download and send audio files!\n\n"
+        "<b>Available Commands:</b>\n"
+        "• /start - Start the bot\n"
+        "• /help - How to use\n"
+        "• /ping - Check latency & response speed\n"
+        "• /credits - Developer & channel information\n"
+        "</blockquote>"
+    )
+    await msg.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Updates Channel", url=config.CHANNEL_URL),
+                InlineKeyboardButton("Developer", url=config.DEV_URL),
+            ]
+        ]),
+    )
+
+
+async def cmd_ping(bot: Client, msg: Message):
+    start_t = time.time()
+    sent_msg = await msg.reply_text("🏓 <i>Pinging...</i>", parse_mode=ParseMode.HTML)
+    latency = round((time.time() - start_t) * 1000, 2)
+    await sent_msg.edit_text(
+        f"<blockquote>🏓 <b>Pong!</b>\n⚡ <b>Latency:</b> <code>{latency}ms</code>\n🟢 <b>Status:</b> <i>Online & Ready</i></blockquote>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_credits(bot: Client, msg: Message):
+    await msg.reply_text(
+        "<blockquote>\n"
+        "<b>Credits & Support</b>\n\n"
+        "<b>Developer:</b> @himayubhai\n"
+        "<b>Updates Channel:</b> @az_hawas_adda\n\n"
+        "<i>Enjoy downloading your favorite Spotify music!</i>\n"
+        "</blockquote>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Updates Channel", url=config.CHANNEL_URL),
+                InlineKeyboardButton("Developer", url=config.DEV_URL),
+            ]
         ]),
     )
 
@@ -313,43 +381,65 @@ async def cb_credits(_, cb: CallbackQuery):
     )
 
 
+async def cb_help(_, cb: CallbackQuery):
+    await cb.answer()
+    await cmd_help(None, cb.message)
+
+
 async def handle_message(bot: Client, msg: Message):
     text = msg.text.strip()
 
-    match = SPOTIFY_RE.search(text)
-    if not match:
-        await msg.reply_text("that doesn't look like a spotify link.")
+    resolved = resolve_spotify_url(text)
+    if not resolved:
+        await msg.reply_text(
+            "<blockquote>⚠️ That doesn't look like a valid Spotify track, album, or playlist link.\n\nSend /help to view examples!</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
         return
 
-    url   = match.group(0)
-    stype = spotify_type(url)
-    user  = msg.from_user
+    stype, url = resolved
+    user = msg.from_user
 
     # ── single track ──────────────────────────────────────────────────────────
     if stype == "track":
-        status = await msg.reply_text("fetching track...")
+        status = await msg.reply_text("🔍 <i>Fetching track information...</i>", parse_mode=ParseMode.HTML)
         local_path = thumb = None
         try:
             loop = asyncio.get_running_loop()
             name, title, artist, local_path, thumb = await loop.run_in_executor(
                 None, spotify_get_track, url
             )
-            await status.edit_text("uploading...")
-            if thumb:
-                await msg.reply_photo(photo=thumb, caption=f"<b>{name}</b>", parse_mode=ParseMode.HTML)
-            await msg.reply_audio(
-                audio=local_path,
-                title=title,
-                performer=artist,
-                thumb=thumb,
-                parse_mode=ParseMode.HTML,
-            )
-            await status.delete()
+            await status.edit_text("📥 <i>Uploading audio to Telegram...</i>", parse_mode=ParseMode.HTML)
+            
+            # Send audio with FloodWait retry
+            for retry in range(3):
+                try:
+                    await msg.reply_audio(
+                        audio=local_path,
+                        title=title,
+                        performer=artist,
+                        thumb=thumb,
+                        caption=f"<b>{name}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    break
+                except pyrogram.errors.FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                except Exception as e:
+                    if retry == 2:
+                        raise e
+                    await asyncio.sleep(1)
+
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
             await log_download(bot, user, name)
 
         except Exception as e:
             await status.edit_text(
-                f"something went wrong\n\n<code>{e}</code>",
+                f"<blockquote>❌ <b>Something went wrong:</b>\n\n<code>{e}</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         finally:
@@ -358,78 +448,108 @@ async def handle_message(bot: Client, msg: Message):
 
     # ── playlist / album ──────────────────────────────────────────────────────
     elif stype in ("playlist", "album"):
-        status = await msg.reply_text("fetching playlist...")
+        status = await msg.reply_text(
+            f"🔍 <i>Fetching {stype} details from Spotify...</i>",
+            parse_mode=ParseMode.HTML
+        )
 
-        completed = 0
-        failed    = 0
-        main_loop = asyncio.get_event_loop()
-
-        def on_result(_, total, name, title, artist, local_path, thumb, err):
-            nonlocal completed, failed
-            if err:
-                failed += 1
-            else:
-                completed += 1
-            asyncio.run_coroutine_threadsafe(
-                _send_track(
-                    bot, msg, status,
-                    name, title, artist, local_path, thumb, err,
-                    completed, failed, total, user,
-                ),
-                loop=main_loop,
-            )
-
+        loop = asyncio.get_running_loop()
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: spotify_get_playlist(url, on_result=on_result),
-            )
-            try:
-                await status.delete()
-            except Exception:
-                pass
-
+            forms, fallback_thumb = await loop.run_in_executor(None, _fetch_playlist_forms, url)
         except Exception as e:
             await status.edit_text(
-                f"something went wrong\n\n<code>{e}</code>",
+                f"<blockquote>❌ <b>Error fetching {stype}:</b>\n\n<code>{e}</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
+            return
 
-    else:
-        await msg.reply_text("unsupported spotify link type.")
+        total = len(forms)
+        if total == 0:
+            await status.edit_text(
+                f"<blockquote>⚠️ <b>No tracks found!</b>\nThe {stype} might be empty, private, or region-restricted.</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-
-async def _send_track(
-    bot, msg, status,
-    name, title, artist, local_path, thumb, err,
-    completed, failed, total, user,
-):
-    if err:
-        print(f"[skip] {name}: {err}")
-        return
-    try:
-        await msg.reply_audio(
-            audio=local_path,
-            caption=f"<b>{name}</b>",
-            title=title,
-            performer=artist,
-            thumb=thumb,
+        await status.edit_text(
+            f"<blockquote>🎵 <b>Found {total} tracks in {stype}!</b>\n\nStarting download and delivery...</blockquote>",
             parse_mode=ParseMode.HTML,
         )
-        await log_download(bot, user, name)
+
+        completed = 0
+        failed = 0
+        last_edit_time = time.time()
+
+        for index, form in enumerate(forms, start=1):
+            # Status update throttled (at least 2.5 seconds apart)
+            now = time.time()
+            if now - last_edit_time > 2.5:
+                try:
+                    await status.edit_text(
+                        f"<blockquote>📥 <b>Downloading {stype.capitalize()} ({index}/{total})</b>\n\n"
+                        f"✅ <b>Sent:</b> {completed}   ❌ <b>Failed:</b> {failed}</blockquote>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    last_edit_time = now
+                except Exception:
+                    pass
+
+            local_path = None
+            thumb_path = None
+            try:
+                name, title, artist, local_path, thumb_path, err = await loop.run_in_executor(
+                    None, _download_track_from_form, form, index, fallback_thumb
+                )
+                if err or not local_path:
+                    print(f"[playlist] track {index} skipped: {err}")
+                    failed += 1
+                    continue
+
+                sent = False
+                for retry in range(3):
+                    try:
+                        await msg.reply_audio(
+                            audio=local_path,
+                            title=title,
+                            performer=artist,
+                            thumb=thumb_path,
+                            caption=f"<b>{name}</b>",
+                            parse_mode=ParseMode.HTML,
+                        )
+                        sent = True
+                        break
+                    except pyrogram.errors.FloodWait as fw:
+                        print(f"[floodwait] Waiting {fw.value}s...")
+                        await asyncio.sleep(fw.value + 1)
+                    except Exception as e:
+                        print(f"[send error] {e}")
+                        await asyncio.sleep(1.5)
+
+                if sent:
+                    completed += 1
+                    await log_download(bot, user, name)
+                else:
+                    failed += 1
+
+                await asyncio.sleep(1.0)
+
+            except Exception as e:
+                print(f"[track error] {e}")
+                failed += 1
+            finally:
+                cleanup(local_path)
+                cleanup(thumb_path)
+
         try:
             await status.edit_text(
-                f"<blockquote>📥 <b>{completed + failed}/{total}</b> done\n✅ <b>{completed}</b> succeeded   ❌ <b>{failed}</b> failed</blockquote>",
+                f"<blockquote>🎉 <b>{stype.capitalize()} Complete!</b>\n\n"
+                f"📁 <b>Total Tracks:</b> {total}\n"
+                f"✅ <b>Successfully Sent:</b> {completed}\n"
+                f"❌ <b>Failed:</b> {failed}</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
-    except Exception as e:
-        print(f"[send] {name}: {e}")
-    finally:
-        cleanup(local_path)
-        cleanup(thumb)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -442,13 +562,37 @@ async def main():
         bot_token=config.BOT_TOKEN,
     )
 
-    bot.add_handler(MessageHandler(cmd_start,        filters.command("start") & filters.private))
-    bot.add_handler(CallbackQueryHandler(cb_credits,  filters.regex("^credits$")))
-    bot.add_handler(MessageHandler(handle_message,
-                                   filters.text & filters.private & ~filters.command(["start"])))
+    # Command handlers
+    bot.add_handler(MessageHandler(cmd_start, filters.command("start") & filters.private))
+    bot.add_handler(MessageHandler(cmd_help, filters.command("help") & filters.private))
+    bot.add_handler(MessageHandler(cmd_ping, filters.command("ping") & filters.private))
+    bot.add_handler(MessageHandler(cmd_credits, filters.command("credits") & filters.private))
+
+    # Callback query handlers
+    bot.add_handler(CallbackQueryHandler(cb_credits, filters.regex("^credits$")))
+    bot.add_handler(CallbackQueryHandler(cb_help, filters.regex("^help$")))
+
+    # Message handler
+    bot.add_handler(MessageHandler(
+        handle_message,
+        filters.text & filters.private & ~filters.command(["start", "help", "ping", "credits"])
+    ))
 
     await mongodb.connect()
     await bot.start()
+
+    # Automatically register bot commands with Telegram
+    try:
+        await bot.set_bot_commands([
+            BotCommand("start", "Start the bot & main menu"),
+            BotCommand("help", "How to use this bot"),
+            BotCommand("ping", "Check latency & status"),
+            BotCommand("credits", "Developer & channel info"),
+        ])
+        print("[bot] Bot commands registered with Telegram.")
+    except Exception as e:
+        print(f"[bot] Could not register commands: {e}")
+
     print("[bot] running — waiting for messages...")
     await idle()
     await bot.stop()
