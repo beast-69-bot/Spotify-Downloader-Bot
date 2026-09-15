@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import base64
+from difflib import SequenceMatcher
 
 import requests
 import pyrogram.errors
@@ -33,9 +34,9 @@ UA = (
     "Chrome/134.0.0.0 Safari/537.36"
 )
 
-# Regex matching track, playlist, and album links (including localized intl-xx URLs)
+# Regex matching track, playlist, album, episode, and show links (including intl-xx URLs)
 SPOTIFY_RE = re.compile(
-    r"https?://(?:open\.)?spotify\.(?:com|link)/(?:intl-[a-zA-Z_-]+/)?(track|playlist|album)/([A-Za-z0-9]+)"
+    r"https?://(?:open\.)?spotify\.(?:com|link)/(?:intl-[a-zA-Z_-]+/)?(track|playlist|album|episode|show)/([A-Za-z0-9]+)"
 )
 
 
@@ -108,7 +109,10 @@ def _download_thumb(url: str, name: str):
 
 def _download_file(url: str, name: str) -> str:
     safe = re.sub(r'[\\/*?:"<>|]', "", name)[:100]
-    path = os.path.join(DOWNLOAD_DIR, f"{safe}.mp3")
+    ext = ".mp3"
+    if ".m4a" in url.lower():
+        ext = ".m4a"
+    path = os.path.join(DOWNLOAD_DIR, f"{safe}{ext}")
     with requests.get(url, stream=True, timeout=120, headers={"User-Agent": UA}) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
@@ -189,7 +193,59 @@ def _download_track_from_form(form_data: dict, index: int, fallback_thumb: str |
     return name, title, artist, local_path, thumb, err
 
 
-def resolve_spotify_url(text: str) -> tuple[str, str] | None:
+# ── Podcast helpers ───────────────────────────────────────────────────────────
+
+def fetch_episode_meta(episode_id: str):
+    url = f"https://open.spotify.com/embed/episode/{episode_id}"
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        script = soup.find("script", id="__NEXT_DATA__")
+        if not script:
+            return None
+        data = json.loads(script.string)
+        entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+        title = entity.get("name")
+        show = entity.get("subtitle") or ""
+        images = entity.get("visualIdentity", {}).get("image", [])
+        thumb = images[0].get("url") if images else None
+        preview_url = entity.get("audioPreview", {}).get("url")
+        return {
+            "title": title,
+            "show": show,
+            "thumb": thumb,
+            "preview_url": preview_url
+        }
+    except Exception as e:
+        print(f"[podcast meta error] {e}")
+        return None
+
+
+def find_podcast_audio(title: str, show: str = ""):
+    search_queries = []
+    if show and title:
+        search_queries.append(f"{show} {title}")
+    if title:
+        search_queries.append(title)
+    if show:
+        search_queries.append(show)
+
+    for query in search_queries:
+        url = f"https://itunes.apple.com/search?term={requests.utils.quote(query)}&media=podcast&entity=podcastEpisode&limit=10"
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            for res in data.get("results", []):
+                track_name = res.get("trackName", "")
+                ratio = SequenceMatcher(None, title.lower(), track_name.lower()).ratio()
+                if ratio > 0.55 or title.lower() in track_name.lower() or track_name.lower() in title.lower():
+                    return res.get("episodeUrl"), res.get("artworkUrl600")
+        except Exception as e:
+            print(f"[podcast search error] {e}")
+    return None, None
+
+
+def resolve_spotify_url(text: str) -> tuple[str, str, str] | None:
     short_match = re.search(r"https?://(?:spotify\.link|spoti\.fi)/[A-Za-z0-9]+", text)
     if short_match:
         try:
@@ -204,7 +260,7 @@ def resolve_spotify_url(text: str) -> tuple[str, str] | None:
     stype = match.group(1)
     sid   = match.group(2)
     normalized_url = f"https://open.spotify.com/{stype}/{sid}"
-    return stype, normalized_url
+    return stype, normalized_url, sid
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -259,10 +315,10 @@ async def log_download(bot: Client, user, name: str) -> None:
     uname = user.first_name + (f" {user.last_name}" if user.last_name else "")
     text  = (
         "<blockquote>"
-        "🎵 <b>Track Downloaded</b>\n\n"
+        "🎵 <b>Track / Episode Downloaded</b>\n\n"
         f"<b>User     :</b>  <b>{uname}</b>  ({tag})\n"
         f"<b>ID       :</b>  <code>{user.id}</code>\n\n"
-        f"<b>Track    :</b>  <i>{name}</i>"
+        f"<b>Title    :</b>  <i>{name}</i>"
         "</blockquote>"
     )
     try:
@@ -289,20 +345,21 @@ async def cmd_start(bot: Client, msg: Message):
 
     await msg.reply_text(
         "<blockquote>\n"
-        "<b>Hey 👋 Welcome to Spotify Music Downloader Bot!</b>\n\n"
-        "<b>Send me any Spotify link and I'll download it for you:</b>\n"
-        "• 🎵 Single Track\n"
-        "• 📀 Album\n"
-        "• 📋 Playlist\n\n"
-        "<i>Just paste your Spotify link below to get started!</i>\n"
+        "🎵 <b>Welcome to Spotify Music & Podcast Downloader!</b>\n\n"
+        "<b>I can download high-quality audio from Spotify:</b>\n"
+        "• 🎧 <b>Tracks:</b> 320kbps MP3 with Album Art\n"
+        "• 📀 <b>Albums:</b> Complete album tracks\n"
+        "• 📋 <b>Playlists:</b> Full playlist with live progress\n"
+        "• 🎙️ <b>Podcasts:</b> Episodes with cover & show tags\n\n"
+        "<i>⚡ Just paste any Spotify link below to get started!</i>\n"
         "</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("Updates Channel", url=config.CHANNEL_URL, style=ButtonStyle.PRIMARY),
-                InlineKeyboardButton("Dev", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
+                InlineKeyboardButton("Updates Channel 📢", url=config.CHANNEL_URL, style=ButtonStyle.PRIMARY),
+                InlineKeyboardButton("Dev 👨‍💻", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
             ],
             [
-                InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
+                InlineKeyboardButton("Credits ⭐", callback_data="credits", style=ButtonStyle.PRIMARY),
                 InlineKeyboardButton("Help 📖", callback_data="help", style=ButtonStyle.PRIMARY),
             ],
         ]),
@@ -312,18 +369,19 @@ async def cmd_start(bot: Client, msg: Message):
 async def cmd_help(bot: Client, msg: Message):
     text = (
         "<blockquote>\n"
-        "📖 <b>Spotify Music Bot Help Guide</b>\n\n"
-        "<b>Supported Links:</b>\n"
+        "📖 <b>Spotify Downloader Help & Usage Guide</b>\n\n"
+        "<b>Supported Spotify Links:</b>\n"
         "• 🎵 <b>Track:</b> <code>https://open.spotify.com/track/...</code>\n"
         "• 📀 <b>Album:</b> <code>https://open.spotify.com/album/...</code>\n"
-        "• 📋 <b>Playlist:</b> <code>https://open.spotify.com/playlist/...</code>\n\n"
+        "• 📋 <b>Playlist:</b> <code>https://open.spotify.com/playlist/...</code>\n"
+        "• 🎙️ <b>Podcast:</b> <code>https://open.spotify.com/episode/...</code>\n\n"
         "<b>How to use:</b>\n"
-        "1. Open Spotify App or Web.\n"
-        "2. Copy the share link of any track, album, or playlist.\n"
-        "3. Send the link here. The bot will automatically download and send audio files!\n\n"
+        "1. Open Spotify and copy the link of any song, album, or podcast.\n"
+        "2. Send or paste the link here in this chat.\n"
+        "3. The bot will automatically fetch, process, and send your audio!\n\n"
         "<b>Available Commands:</b>\n"
         "• /start - Start the bot\n"
-        "• /help - How to use\n"
+        "• /help - Show this guide\n"
         "• /ping - Check latency & response speed\n"
         "• /credits - Developer & channel information\n"
         "</blockquote>"
@@ -356,7 +414,7 @@ async def cmd_credits(bot: Client, msg: Message):
         "<b>Credits & Support</b>\n\n"
         "<b>Developer:</b> @himayubhai\n"
         "<b>Updates Channel:</b> @az_hawas_adda\n\n"
-        "<i>Enjoy downloading your favorite Spotify music!</i>\n"
+        "<i>Enjoy downloading your favorite Spotify music and podcasts!</i>\n"
         "</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
@@ -375,7 +433,7 @@ async def cb_credits(_, cb: CallbackQuery):
         "<b>Credits</b>\n\n"
         "<b>Developer:</b> @himayubhai\n"
         "<b>Updates Channel:</b> @az_hawas_adda\n\n"
-        "<i>Enjoy downloading your favorite Spotify music!</i>\n"
+        "<i>Enjoy downloading your favorite Spotify music & podcasts!</i>\n"
         "</blockquote>",
         parse_mode=ParseMode.HTML,
     )
@@ -392,12 +450,12 @@ async def handle_message(bot: Client, msg: Message):
     resolved = resolve_spotify_url(text)
     if not resolved:
         await msg.reply_text(
-            "<blockquote>⚠️ That doesn't look like a valid Spotify track, album, or playlist link.\n\nSend /help to view examples!</blockquote>",
+            "<blockquote>⚠️ That doesn't look like a valid Spotify track, album, playlist, or podcast link.\n\nSend /help to view examples!</blockquote>",
             parse_mode=ParseMode.HTML
         )
         return
 
-    stype, url = resolved
+    stype, url, sid = resolved
     user = msg.from_user
 
     # ── single track ──────────────────────────────────────────────────────────
@@ -411,7 +469,6 @@ async def handle_message(bot: Client, msg: Message):
             )
             await status.edit_text("📥 <i>Uploading audio to Telegram...</i>", parse_mode=ParseMode.HTML)
             
-            # Send audio with FloodWait retry
             for retry in range(3):
                 try:
                     await msg.reply_audio(
@@ -481,7 +538,6 @@ async def handle_message(bot: Client, msg: Message):
         last_edit_time = time.time()
 
         for index, form in enumerate(forms, start=1):
-            # Status update throttled (at least 2.5 seconds apart)
             now = time.time()
             if now - last_edit_time > 2.5:
                 try:
@@ -550,6 +606,94 @@ async def handle_message(bot: Client, msg: Message):
             )
         except Exception:
             pass
+
+    # ── podcast episode ───────────────────────────────────────────────────────
+    elif stype == "episode":
+        status = await msg.reply_text("🔍 <i>Fetching podcast episode details...</i>", parse_mode=ParseMode.HTML)
+        local_path = thumb_path = None
+        try:
+            loop = asyncio.get_running_loop()
+            meta = await loop.run_in_executor(None, fetch_episode_meta, sid)
+            if not meta or not meta.get("title"):
+                await status.edit_text("❌ <b>Could not retrieve episode details.</b>", parse_mode=ParseMode.HTML)
+                return
+
+            title = meta["title"]
+            show = meta["show"] or "Podcast"
+            name = f"{title} - {show}"
+            thumb_url = meta["thumb"]
+
+            await status.edit_text(
+                f"<blockquote>🎙️ <b>Found:</b> <i>{title}</i>\n📻 <b>Podcast:</b> <i>{show}</i>\n\n📥 <i>Downloading audio stream...</i></blockquote>",
+                parse_mode=ParseMode.HTML
+            )
+
+            # Search for public audio file
+            audio_url, itunes_thumb = await loop.run_in_executor(None, find_podcast_audio, title, show)
+            is_preview = False
+            if not audio_url and meta.get("preview_url"):
+                audio_url = meta["preview_url"]
+                is_preview = True
+
+            if not audio_url:
+                await status.edit_text(
+                    "<blockquote>⚠️ <b>Spotify Exclusive DRM Podcast</b>\n\n"
+                    "This podcast episode is DRM-protected and hosted exclusively inside Spotify without an external public audio stream.</blockquote>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            target_thumb = thumb_url or itunes_thumb
+            local_path = await loop.run_in_executor(None, _download_file, audio_url, name)
+            thumb_path = await loop.run_in_executor(None, _download_thumb, target_thumb, name)
+
+            caption = f"🎙️ <b>{title}</b>\n📻 <b>Show:</b> <i>{show}</i>"
+            if is_preview:
+                caption += "\n\n<i>⚠️ Note: Episode is a Spotify DRM exclusive. Sending high-quality audio preview.</i>"
+
+            # Send to Telegram with retry
+            for retry in range(3):
+                try:
+                    await msg.reply_audio(
+                        audio=local_path,
+                        title=title,
+                        performer=show,
+                        thumb=thumb_path,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    break
+                except pyrogram.errors.FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
+                except Exception as e:
+                    if retry == 2:
+                        raise e
+                    await asyncio.sleep(1)
+
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            await log_download(bot, user, name)
+
+        except Exception as e:
+            await status.edit_text(
+                f"<blockquote>❌ <b>Error downloading podcast:</b>\n\n<code>{e}</code></blockquote>",
+                parse_mode=ParseMode.HTML
+            )
+        finally:
+            cleanup(local_path)
+            cleanup(thumb_path)
+
+    # ── podcast show / series ─────────────────────────────────────────────────
+    elif stype == "show":
+        await msg.reply_text(
+            "<blockquote>📻 <b>Podcast Show / Series Link Detected</b>\n\n"
+            "To download a specific episode, please copy and send the link of that <b>individual episode</b>!\n\n"
+            "<i>Example:</i> <code>https://open.spotify.com/episode/...</code></blockquote>",
+            parse_mode=ParseMode.HTML
+        )
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
