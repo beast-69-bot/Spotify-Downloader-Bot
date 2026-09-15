@@ -288,10 +288,15 @@ async def cmd_start(bot: Client, msg: Message):
         "<b>Send me a Spotify track or playlist link and I'll download it for you.</b>\n\n"
         "<i>Just paste the link below.</i>\n"
         "</blockquote>",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("Dev", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Updates Channel", url=config.CHANNEL_URL, style=ButtonStyle.PRIMARY),
+                InlineKeyboardButton("Dev", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
+            ],
+            [
+                InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
+            ],
+        ]),
     )
 
 
@@ -300,8 +305,9 @@ async def cb_credits(_, cb: CallbackQuery):
     await cb.message.reply_text(
         "<blockquote>\n"
         "<b>Credits</b>\n\n"
-        "<i>This bot was built Mark</b>.\n\n"
-        "<i>Mark did most of the heavy lifting - if it helps you, just give credit. That's all.</i>\n"
+        "<b>Developer:</b> @himayubhai\n"
+        "<b>Updates Channel:</b> @az_hawas_adda\n\n"
+        "<i>Enjoy downloading your favorite Spotify music!</i>\n"
         "</blockquote>",
         parse_mode=ParseMode.HTML,
     )

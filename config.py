@@ -11,8 +11,9 @@ API_ID    = int(os.getenv("API_ID", "0"))
 API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ── developer info ───────────────────────────────────────────────────────────
-DEV_URL = os.getenv("DEV_URL", "https://t.me/DmOwner")
+# ── developer & channel info ──────────────────────────────────────────────────
+DEV_URL = os.getenv("DEV_URL", "https://t.me/himayubhai")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/az_hawas_adda")
 
 # ── log channel ──────────────────────────────────────────────────────────────
 # set to your private channel's numeric id, e.g. -1001234567890

@@ -34,7 +34,8 @@ A Telegram bot that downloads Spotify tracks, playlists, and albums and sends th
 | `MONGO_URI` | ❌ | MongoDB connection string (Optional — leave empty to run without DB) |
 | `DB_NAME` | ❌ | Database name (default: `spoti_music_bot`) |
 | `LOG_CHANNEL` | ❌ | Numeric ID of your private log channel (default: `0` = off) |
-| `DEV_URL` | ❌ | Your Telegram profile URL shown in the /start button |
+| `DEV_URL` | ❌ | Your Telegram profile URL shown in the /start button (default: `https://t.me/himayubhai`) |
+| `CHANNEL_URL` | ❌ | Your Telegram channel URL shown in the /start button (default: `https://t.me/az_hawas_adda`) |
 
 ---
 
@@ -69,4 +70,4 @@ Also ships with ready configs for **Railway** (`railway.toml`), **Render** (`ren
 
 ## Credits
 
-Made by **LastPerson X Mark**.
+Developed by **@himayubhai** | Updates: **@az_hawas_adda**.
