@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import json
 import time
 import asyncio
@@ -92,24 +93,38 @@ def get_lyrics(title: str, artist: str) -> str | None:
 
 
 def format_audio_caption(title: str, artist: str, lyrics: str | None = None) -> str:
-    """Format Telegram audio caption with title, artist, lyrics, and credits within 1024 chars."""
-    header = f"🎵 <b>{title}</b>\n👤 <b>Artist:</b> <i>{artist}</i>"
+    """Format Telegram audio caption with title, artist, expandable lyrics quote, and credits within 1024 chars."""
+    safe_title = html.escape(title)
+    safe_artist = html.escape(artist)
+    header = f"🎵 <b>{safe_title}</b>\n👤 <b>Artist:</b> <i>{safe_artist}</i>"
     footer = "\n\n<i>Powered by @himayubhai</i>"
 
     if not lyrics:
         return header + footer
 
-    # Telegram max caption limit is 1024 characters
-    max_len = 1020 - len(header) - len(footer) - 25
     clean_lyrics = lyrics.strip()
 
-    if len(clean_lyrics) <= max_len:
+    # Plain text length limit for Telegram audio caption is 1024 characters
+    # Account for plain length of header (~len(title)+len(artist)+25), footer (~30), and labels (~25)
+    plain_header_len = len(title) + len(artist) + 25
+    plain_footer_len = 30
+    available_plain_len = 1024 - plain_header_len - plain_footer_len - 30
+
+    if len(clean_lyrics) <= available_plain_len:
         lyr_snippet = clean_lyrics
     else:
-        truncated = clean_lyrics[:max_len - 15].rsplit("\n", 1)[0]
-        lyr_snippet = f"{truncated}...\n<i>[Lyrics Continued]</i>"
+        truncated = clean_lyrics[:available_plain_len - 25].rsplit("\n", 1)[0]
+        lyr_snippet = f"{truncated}\n... [Lyrics Continued]"
 
-    return f"{header}\n\n📝 <b>Lyrics:</b>\n<i>{lyr_snippet}</i>{footer}"
+    safe_lyrics = html.escape(lyr_snippet)
+
+    return (
+        f"{header}\n\n"
+        f"📝 <b>Lyrics:</b>\n"
+        f"<blockquote expandable>{safe_lyrics}</blockquote>"
+        f"{footer}"
+    )
+
 
 
 # ── Spotify Scraper ───────────────────────────────────────────────────────────
@@ -622,9 +637,12 @@ async def handle_message(bot: Client, msg: Message):
                 except pyrogram.errors.FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
                 except Exception as e:
+                    if retry == 1:
+                        caption = f"🎵 <b>{html.escape(title)}</b>\n👤 <b>Artist:</b> <i>{html.escape(artist)}</i>\n\n<i>Powered by @himayubhai</i>"
                     if retry == 2:
                         raise e
                     await asyncio.sleep(1)
+
 
             try:
                 await status.delete()
@@ -765,7 +783,10 @@ async def handle_message(bot: Client, msg: Message):
                     await asyncio.sleep(fw.value + 1)
                 except Exception as e:
                     print(f"[send error] {e}")
+                    if retry == 1:
+                        caption = f"🎵 <b>{html.escape(title)}</b>\n👤 <b>Artist:</b> <i>{html.escape(artist)}</i>\n\n<i>Powered by @himayubhai</i>"
                     await asyncio.sleep(1.0)
+
 
             if sent:
                 completed += 1
