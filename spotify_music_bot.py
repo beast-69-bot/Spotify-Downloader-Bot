@@ -40,6 +40,31 @@ SPOTIFY_RE = re.compile(
 )
 
 
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def make_progress_bar(current: int, total: int, length: int = 12) -> str:
+    """Create a sleek, filled/unfilled visual progress bar."""
+    if total <= 0:
+        return "▱" * length
+    percent = min(1.0, current / total)
+    filled = int(round(length * percent))
+    empty = length - filled
+    return "▰" * filled + "▱" * empty
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds into readable time string."""
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    else:
+        return f"{s}s"
+
+
 # ── Spotify scraper ───────────────────────────────────────────────────────────
 
 def _make_session() -> requests.Session:
@@ -342,7 +367,6 @@ async def cmd_start(bot: Client, msg: Message):
             )
             await log_new_user(bot, user)
         else:
-            # Ensure existing user is recorded
             await mongodb.add_user(
                 user_id=user.id,
                 first_name=user.first_name,
@@ -358,7 +382,7 @@ async def cmd_start(bot: Client, msg: Message):
         "<b>I can download high-quality audio from Spotify:</b>\n"
         "• 🎧 <b>Tracks:</b> 320kbps MP3 with Album Art\n"
         "• 📀 <b>Albums:</b> Complete album tracks\n"
-        "• 📋 <b>Playlists:</b> Full playlist with live progress\n"
+        "• 📋 <b>Playlists:</b> Full playlist with visual progress\n"
         "• 🎙️ <b>Podcasts:</b> Episodes with cover & show tags\n\n"
         "<i>⚡ Just paste any Spotify link below to get started!</i>\n"
         "</blockquote>",
@@ -420,7 +444,7 @@ async def cmd_help(bot: Client, msg: Message):
         "<b>How to use:</b>\n"
         "1. Open Spotify and copy the link of any song, album, or podcast.\n"
         "2. Send or paste the link here in this chat.\n"
-        "3. The bot will automatically fetch, process, and send your audio!\n\n"
+        "3. The bot will automatically fetch, process, and send your audio with progress updates!\n\n"
         "<b>Available Commands:</b>\n"
         "• /start - Start the bot\n"
         "• /stats - View total users & stats\n"
@@ -491,7 +515,7 @@ async def handle_message(bot: Client, msg: Message):
     text = msg.text.strip()
     user = msg.from_user
 
-    # Keep track of active users
+    # Keep track of active users in database
     try:
         await mongodb.add_user(user.id, user.first_name, user.username, user.dc_id)
     except Exception:
@@ -509,14 +533,28 @@ async def handle_message(bot: Client, msg: Message):
 
     # ── single track ──────────────────────────────────────────────────────────
     if stype == "track":
-        status = await msg.reply_text("🔍 <i>Fetching track information...</i>", parse_mode=ParseMode.HTML)
+        status = await msg.reply_text(
+            "<blockquote>\n"
+            "🔍 <b>Searching Spotify...</b>\n\n"
+            "⚡ <i>Fetching track information...</i>\n"
+            "</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
         local_path = thumb = None
         try:
             loop = asyncio.get_running_loop()
             name, title, artist, local_path, thumb = await loop.run_in_executor(
                 None, spotify_get_track, url
             )
-            await status.edit_text("📥 <i>Uploading audio to Telegram...</i>", parse_mode=ParseMode.HTML)
+            await status.edit_text(
+                "<blockquote>\n"
+                "📥 <b>Downloading & Converting...</b>\n\n"
+                f"🎵 <b>Track:</b> <i>{name}</i>\n"
+                "⚡ <b>Quality:</b> <code>320kbps MP3</code>\n"
+                "⏳ <i>Uploading to Telegram...</i>\n"
+                "</blockquote>",
+                parse_mode=ParseMode.HTML
+            )
             
             for retry in range(3):
                 try:
@@ -555,13 +593,12 @@ async def handle_message(bot: Client, msg: Message):
     # ── playlist / album ──────────────────────────────────────────────────────
     elif stype in ("playlist", "album"):
         status = await msg.reply_text(
-            f"🔍 <i>Fetching {stype} details from Spotify...</i>",
+            f"<blockquote>🔍 <i>Fetching {stype} details from Spotify...</i></blockquote>",
             parse_mode=ParseMode.HTML
         )
 
         loop = asyncio.get_running_loop()
         try:
-            # Retain the exact session that loaded the forms to preserve cookies and CSRF tokens
             session, forms, fallback_thumb = await loop.run_in_executor(None, _fetch_playlist_forms, url)
         except Exception as e:
             await status.edit_text(
@@ -578,38 +615,66 @@ async def handle_message(bot: Client, msg: Message):
             )
             return
 
-        await status.edit_text(
-            f"<blockquote>🎵 <b>Found {total} tracks in {stype}!</b>\n\nStarting download and delivery...</blockquote>",
-            parse_mode=ParseMode.HTML,
-        )
-
         completed = 0
         failed = 0
-        last_edit_time = time.time()
+        start_time = time.time()
+        last_edit_time = 0
+
+        async def render_progress(idx: int, trk_name: str, force: bool = False):
+            nonlocal last_edit_time
+            now = time.time()
+            if not force and (now - last_edit_time < 2.0):
+                return
+            percent = round((idx / total) * 100, 1) if total > 0 else 0
+            bar = make_progress_bar(idx, total, length=12)
+            elapsed_str = format_time(now - start_time)
+            text = (
+                "<blockquote>\n"
+                f"📥 <b>Downloading {stype.capitalize()}</b>\n\n"
+                f"🎶 <b>Current:</b> <i>{trk_name}</i>\n"
+                f"📊 <b>Progress:</b> <code>[{idx}/{total}]</code> • <b>{percent}%</b>\n"
+                f"<code>{bar}</code>\n\n"
+                f"✅ <b>Sent:</b> <code>{completed}</code>   ❌ <b>Failed:</b> <code>{failed}</code>\n"
+                f"⏱️ <b>Elapsed:</b> <code>{elapsed_str}</code>\n"
+                "</blockquote>"
+            )
+            try:
+                await status.edit_text(text, parse_mode=ParseMode.HTML)
+                last_edit_time = now
+            except Exception:
+                pass
+
+        # Initial progress display
+        try:
+            init_info = json.loads(base64.b64decode(forms[0].get("data", "")).decode())
+            init_name = init_info.get("name", "Track 1")
+        except Exception:
+            init_name = "Track 1"
+        await render_progress(1, init_name, force=True)
 
         for index, form in enumerate(forms, start=1):
-            now = time.time()
-            if now - last_edit_time > 2.5:
-                try:
-                    await status.edit_text(
-                        f"<blockquote>📥 <b>Downloading {stype.capitalize()} ({index}/{total})</b>\n\n"
-                        f"✅ <b>Sent:</b> {completed}   ❌ <b>Failed:</b> {failed}</blockquote>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    last_edit_time = now
-                except Exception:
-                    pass
+            # Parse track name ahead of download
+            try:
+                info = json.loads(base64.b64decode(form.get("data", "")).decode())
+                t_title = info.get("name", f"Track {index}")
+                t_artist = info.get("artist", "")
+                track_display = f"{t_title} - {t_artist}" if t_artist else t_title
+            except Exception:
+                track_display = f"Track {index}"
+
+            # Update progress UI before starting track
+            await render_progress(index, track_display)
 
             local_path = None
             thumb_path = None
             try:
-                # Pass session to reuse token
                 name, title, artist, local_path, thumb_path, err = await loop.run_in_executor(
                     None, _download_track_from_form, session, form, index, fallback_thumb
                 )
                 if err or not local_path:
                     print(f"[playlist] track {index} skipped: {err}")
                     failed += 1
+                    await render_progress(index, track_display, force=True)
                     continue
 
                 sent = False
@@ -638,6 +703,9 @@ async def handle_message(bot: Client, msg: Message):
                 else:
                     failed += 1
 
+                # Update progress UI after sending track
+                await render_progress(index, track_display, force=True)
+
                 await asyncio.sleep(1.0)
 
             except Exception as e:
@@ -647,12 +715,17 @@ async def handle_message(bot: Client, msg: Message):
                 cleanup(local_path)
                 cleanup(thumb_path)
 
+        total_time = format_time(time.time() - start_time)
         try:
             await status.edit_text(
-                f"<blockquote>🎉 <b>{stype.capitalize()} Complete!</b>\n\n"
-                f"📁 <b>Total Tracks:</b> {total}\n"
-                f"✅ <b>Successfully Sent:</b> {completed}\n"
-                f"❌ <b>Failed:</b> {failed}</blockquote>",
+                "<blockquote>\n"
+                f"🎉 <b>{stype.capitalize()} Download Complete!</b>\n\n"
+                f"📁 <b>Total Tracks:</b> <code>{total}</code>\n"
+                f"✅ <b>Successfully Sent:</b> <code>{completed}</code>\n"
+                f"❌ <b>Failed:</b> <code>{failed}</code>\n"
+                f"⏱️ <b>Total Time:</b> <code>{total_time}</code>\n\n"
+                f"<i>Powered by @himayubhai</i>\n"
+                "</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -660,7 +733,13 @@ async def handle_message(bot: Client, msg: Message):
 
     # ── podcast episode ───────────────────────────────────────────────────────
     elif stype == "episode":
-        status = await msg.reply_text("🔍 <i>Fetching podcast episode details...</i>", parse_mode=ParseMode.HTML)
+        status = await msg.reply_text(
+            "<blockquote>\n"
+            "🎙️ <b>Fetching Podcast Details...</b>\n\n"
+            "⚡ <i>Analyzing episode & audio stream...</i>\n"
+            "</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
         local_path = thumb_path = None
         try:
             loop = asyncio.get_running_loop()
@@ -675,7 +754,12 @@ async def handle_message(bot: Client, msg: Message):
             thumb_url = meta["thumb"]
 
             await status.edit_text(
-                f"<blockquote>🎙️ <b>Found:</b> <i>{title}</i>\n📻 <b>Podcast:</b> <i>{show}</i>\n\n📥 <i>Downloading audio stream...</i></blockquote>",
+                "<blockquote>\n"
+                "🎙️ <b>Downloading Podcast Episode...</b>\n\n"
+                f"📻 <b>Show:</b> <i>{show}</i>\n"
+                f"🎧 <b>Episode:</b> <i>{title}</i>\n\n"
+                "📥 <i>Fetching audio stream...</i>\n"
+                "</blockquote>",
                 parse_mode=ParseMode.HTML
             )
 
