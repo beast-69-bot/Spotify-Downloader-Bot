@@ -4,7 +4,11 @@ import json
 import time
 import asyncio
 import base64
+import functools
 from difflib import SequenceMatcher
+
+# Ensure all prints are immediately flushed to logs
+print = functools.partial(print, flush=True)
 
 import requests
 import pyrogram.errors
@@ -40,10 +44,10 @@ SPOTIFY_RE = re.compile(
 )
 
 
-# ── UI helpers ────────────────────────────────────────────────────────────────
+# ── UI & Text Helpers ─────────────────────────────────────────────────────────
 
 def make_progress_bar(current: int, total: int, length: int = 12) -> str:
-    """Create a sleek, filled/unfilled visual progress bar."""
+    """Create a sleek visual progress bar."""
     if total <= 0:
         return "▱" * length
     percent = min(1.0, current / total)
@@ -65,7 +69,50 @@ def format_time(seconds: float) -> str:
         return f"{s}s"
 
 
-# ── Spotify scraper ───────────────────────────────────────────────────────────
+def get_lyrics(title: str, artist: str) -> str | None:
+    """Fetch lyrics from open APIs (LRCLIB)."""
+    clean_title = re.sub(r"\(.*?\)|\[.*?\]", "", title).strip()
+    clean_artist = artist.split(",")[0].split("&")[0].strip()
+
+    # Try cleaned title/artist
+    for t, a in [(clean_title, clean_artist), (title, artist)]:
+        try:
+            url = "https://lrclib.net/api/get"
+            params = {"track_name": t, "artist_name": a}
+            headers = {"User-Agent": "SpotifyDownloaderBot/1.0"}
+            r = requests.get(url, params=params, headers=headers, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                plain = data.get("plainLyrics")
+                if plain and plain.strip():
+                    return plain.strip()
+        except Exception:
+            pass
+    return None
+
+
+def format_audio_caption(title: str, artist: str, lyrics: str | None = None) -> str:
+    """Format Telegram audio caption with title, artist, lyrics, and credits within 1024 chars."""
+    header = f"🎵 <b>{title}</b>\n👤 <b>Artist:</b> <i>{artist}</i>"
+    footer = "\n\n<i>Powered by @himayubhai</i>"
+
+    if not lyrics:
+        return header + footer
+
+    # Telegram max caption limit is 1024 characters
+    max_len = 1020 - len(header) - len(footer) - 25
+    clean_lyrics = lyrics.strip()
+
+    if len(clean_lyrics) <= max_len:
+        lyr_snippet = clean_lyrics
+    else:
+        truncated = clean_lyrics[:max_len - 15].rsplit("\n", 1)[0]
+        lyr_snippet = f"{truncated}...\n<i>[Lyrics Continued]</i>"
+
+    return f"{header}\n\n📝 <b>Lyrics:</b>\n<i>{lyr_snippet}</i>{footer}"
+
+
+# ── Spotify Scraper ───────────────────────────────────────────────────────────
 
 def _make_session() -> requests.Session:
     s = requests.Session()
@@ -206,7 +253,7 @@ def spotify_get_track(spotify_url: str):
 
 
 def _fetch_playlist_forms(spotify_url: str):
-    """Fetch playlist forms and retain the same session to prevent CSRF token expiration."""
+    """Fetch playlist forms and retain the same session to preserve token continuity."""
     s = _make_session()
     html = _fetch_action(s, spotify_url)
     forms, fallback_thumb = _parse_forms(html)
@@ -219,7 +266,7 @@ def _download_track_from_form(s: requests.Session, form_data: dict, index: int, 
     return name, title, artist, local_path, thumb, err
 
 
-# ── Podcast helpers ───────────────────────────────────────────────────────────
+# ── Podcast Helpers ───────────────────────────────────────────────────────────
 
 def fetch_episode_meta(episode_id: str):
     url = f"https://open.spotify.com/embed/episode/{episode_id}"
@@ -379,10 +426,10 @@ async def cmd_start(bot: Client, msg: Message):
     await msg.reply_text(
         "<blockquote>\n"
         "🎵 <b>Welcome to Spotify Music & Podcast Downloader!</b>\n\n"
-        "<b>I can download high-quality audio from Spotify:</b>\n"
-        "• 🎧 <b>Tracks:</b> 320kbps MP3 with Album Art\n"
+        "<b>I can download high-quality audio with lyrics & cover art:</b>\n"
+        "• 🎧 <b>Tracks:</b> 320kbps MP3 with Lyrics in Caption\n"
         "• 📀 <b>Albums:</b> Complete album tracks\n"
-        "• 📋 <b>Playlists:</b> Full playlist with visual progress\n"
+        "• 📋 <b>Playlists:</b> Fast pipeline with live progress\n"
         "• 🎙️ <b>Podcasts:</b> Episodes with cover & show tags\n\n"
         "<i>⚡ Just paste any Spotify link below to get started!</i>\n"
         "</blockquote>",
@@ -441,10 +488,10 @@ async def cmd_help(bot: Client, msg: Message):
         "• 📀 <b>Album:</b> <code>https://open.spotify.com/album/...</code>\n"
         "• 📋 <b>Playlist:</b> <code>https://open.spotify.com/playlist/...</code>\n"
         "• 🎙️ <b>Podcast:</b> <code>https://open.spotify.com/episode/...</code>\n\n"
-        "<b>How to use:</b>\n"
-        "1. Open Spotify and copy the link of any song, album, or podcast.\n"
-        "2. Send or paste the link here in this chat.\n"
-        "3. The bot will automatically fetch, process, and send your audio with progress updates!\n\n"
+        "<b>Features:</b>\n"
+        "• Fast parallel download & delivery\n"
+        "• Audio file captions include song lyrics automatically\n"
+        "• Real-time visual progress bar with elapsed timer\n\n"
         "<b>Available Commands:</b>\n"
         "• /start - Start the bot\n"
         "• /stats - View total users & stats\n"
@@ -515,7 +562,7 @@ async def handle_message(bot: Client, msg: Message):
     text = msg.text.strip()
     user = msg.from_user
 
-    # Keep track of active users in database
+    # Record active user
     try:
         await mongodb.add_user(user.id, user.first_name, user.username, user.dc_id)
     except Exception:
@@ -546,16 +593,21 @@ async def handle_message(bot: Client, msg: Message):
             name, title, artist, local_path, thumb = await loop.run_in_executor(
                 None, spotify_get_track, url
             )
+
             await status.edit_text(
                 "<blockquote>\n"
-                "📥 <b>Downloading & Converting...</b>\n\n"
+                "📥 <b>Downloading & Fetching Lyrics...</b>\n\n"
                 f"🎵 <b>Track:</b> <i>{name}</i>\n"
                 "⚡ <b>Quality:</b> <code>320kbps MP3</code>\n"
                 "⏳ <i>Uploading to Telegram...</i>\n"
                 "</blockquote>",
                 parse_mode=ParseMode.HTML
             )
-            
+
+            # Fetch lyrics concurrently
+            lyrics = await loop.run_in_executor(None, get_lyrics, title, artist)
+            caption = format_audio_caption(title, artist, lyrics)
+
             for retry in range(3):
                 try:
                     await msg.reply_audio(
@@ -563,7 +615,7 @@ async def handle_message(bot: Client, msg: Message):
                         title=title,
                         performer=artist,
                         thumb=thumb,
-                        caption=f"<b>{name}</b>",
+                        caption=caption,
                         parse_mode=ParseMode.HTML,
                     )
                     break
@@ -590,7 +642,7 @@ async def handle_message(bot: Client, msg: Message):
             cleanup(local_path)
             cleanup(thumb)
 
-    # ── playlist / album ──────────────────────────────────────────────────────
+    # ── playlist / album (FAST PIPELINED DOWNLOADER) ──────────────────────────
     elif stype in ("playlist", "album"):
         status = await msg.reply_text(
             f"<blockquote>🔍 <i>Fetching {stype} details from Spotify...</i></blockquote>",
@@ -644,7 +696,7 @@ async def handle_message(bot: Client, msg: Message):
             except Exception:
                 pass
 
-        # Initial progress display
+        # Initial progress render
         try:
             init_info = json.loads(base64.b64decode(forms[0].get("data", "")).decode())
             init_name = init_info.get("name", "Track 1")
@@ -652,68 +704,81 @@ async def handle_message(bot: Client, msg: Message):
             init_name = "Track 1"
         await render_progress(1, init_name, force=True)
 
-        for index, form in enumerate(forms, start=1):
-            # Parse track name ahead of download
-            try:
-                info = json.loads(base64.b64decode(form.get("data", "")).decode())
-                t_title = info.get("name", f"Track {index}")
-                t_artist = info.get("artist", "")
-                track_display = f"{t_title} - {t_artist}" if t_artist else t_title
-            except Exception:
-                track_display = f"Track {index}"
+        # Async Pipeline: Download Worker (Producer) & Upload Worker (Consumer)
+        # Prefetches up to 3 tracks in advance so download and upload happen simultaneously!
+        queue = asyncio.Queue(maxsize=3)
 
-            # Update progress UI before starting track
-            await render_progress(index, track_display)
+        async def download_producer():
+            for idx, form in enumerate(forms, start=1):
+                try:
+                    name, title, artist, local_path, thumb_path, err = await loop.run_in_executor(
+                        None, _download_track_from_form, session, form, idx, fallback_thumb
+                    )
+                    lyrics = None
+                    if not err and local_path:
+                        lyrics = await loop.run_in_executor(None, get_lyrics, title, artist)
 
-            local_path = None
-            thumb_path = None
-            try:
-                name, title, artist, local_path, thumb_path, err = await loop.run_in_executor(
-                    None, _download_track_from_form, session, form, index, fallback_thumb
-                )
-                if err or not local_path:
-                    print(f"[playlist] track {index} skipped: {err}")
-                    failed += 1
-                    await render_progress(index, track_display, force=True)
-                    continue
+                    await queue.put((idx, name, title, artist, local_path, thumb_path, lyrics, err))
+                except Exception as ex:
+                    print(f"[producer error] track {idx}: {ex}")
+                    await queue.put((idx, f"Track {idx}", f"Track {idx}", "", None, None, None, str(ex)))
 
-                sent = False
-                for retry in range(3):
-                    try:
-                        await msg.reply_audio(
-                            audio=local_path,
-                            title=title,
-                            performer=artist,
-                            thumb=thumb_path,
-                            caption=f"<b>{name}</b>",
-                            parse_mode=ParseMode.HTML,
-                        )
-                        sent = True
-                        break
-                    except pyrogram.errors.FloodWait as fw:
-                        print(f"[floodwait] Waiting {fw.value}s...")
-                        await asyncio.sleep(fw.value + 1)
-                    except Exception as e:
-                        print(f"[send error] {e}")
-                        await asyncio.sleep(1.5)
+            await queue.put(None) # Sentinel to stop consumer
 
-                if sent:
-                    completed += 1
-                    await log_download(bot, user, name)
-                else:
-                    failed += 1
+        # Start background prefetching producer
+        producer_task = asyncio.create_task(download_producer())
 
-                # Update progress UI after sending track
-                await render_progress(index, track_display, force=True)
+        # Consumer: uploads tracks to Telegram with lyrics in captions
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
 
-                await asyncio.sleep(1.0)
+            idx, name, title, artist, local_path, thumb_path, lyrics, err = item
 
-            except Exception as e:
-                print(f"[track error] {e}")
+            # Update progress with current track name
+            await render_progress(idx, name)
+
+            if err or not local_path:
+                print(f"[playlist] track {idx} skipped: {err}")
                 failed += 1
-            finally:
-                cleanup(local_path)
-                cleanup(thumb_path)
+                await render_progress(idx, name, force=True)
+                continue
+
+            caption = format_audio_caption(title, artist, lyrics)
+
+            sent = False
+            for retry in range(3):
+                try:
+                    await msg.reply_audio(
+                        audio=local_path,
+                        title=title,
+                        performer=artist,
+                        thumb=thumb_path,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    sent = True
+                    break
+                except pyrogram.errors.FloodWait as fw:
+                    print(f"[floodwait] Waiting {fw.value}s...")
+                    await asyncio.sleep(fw.value + 1)
+                except Exception as e:
+                    print(f"[send error] {e}")
+                    await asyncio.sleep(1.0)
+
+            if sent:
+                completed += 1
+                await log_download(bot, user, name)
+            else:
+                failed += 1
+
+            cleanup(local_path)
+            cleanup(thumb_path)
+
+            await render_progress(idx, name, force=True)
+
+        await producer_task
 
         total_time = format_time(time.time() - start_time)
         try:
