@@ -181,14 +181,15 @@ def spotify_get_track(spotify_url: str):
 
 
 def _fetch_playlist_forms(spotify_url: str):
+    """Fetch playlist forms and retain the same session to prevent CSRF token expiration."""
     s = _make_session()
     html = _fetch_action(s, spotify_url)
     forms, fallback_thumb = _parse_forms(html)
-    return forms, fallback_thumb
+    return s, forms, fallback_thumb
 
 
-def _download_track_from_form(form_data: dict, index: int, fallback_thumb: str | None = None):
-    s = _make_session()
+def _download_track_from_form(s: requests.Session, form_data: dict, index: int, fallback_thumb: str | None = None):
+    """Download track using the SAME session that fetched the playlist forms."""
     _, name, title, artist, local_path, thumb, err = _fetch_one(s, form_data, index - 1, fallback_thumb)
     return name, title, artist, local_path, thumb, err
 
@@ -340,6 +341,14 @@ async def cmd_start(bot: Client, msg: Message):
                 dc_id=user.dc_id,
             )
             await log_new_user(bot, user)
+        else:
+            # Ensure existing user is recorded
+            await mongodb.add_user(
+                user_id=user.id,
+                first_name=user.first_name,
+                username=user.username,
+                dc_id=user.dc_id,
+            )
     except Exception as e:
         print(f"[db] {e}")
 
@@ -359,10 +368,43 @@ async def cmd_start(bot: Client, msg: Message):
                 InlineKeyboardButton("Dev 👨‍💻", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
             ],
             [
+                InlineKeyboardButton("Stats 📊", callback_data="stats", style=ButtonStyle.PRIMARY),
                 InlineKeyboardButton("Credits ⭐", callback_data="credits", style=ButtonStyle.PRIMARY),
-                InlineKeyboardButton("Help 📖", callback_data="help", style=ButtonStyle.PRIMARY),
             ],
         ]),
+    )
+
+
+async def cmd_stats(bot: Client, msg: Message):
+    total_users = await mongodb.get_total_users()
+    await msg.reply_text(
+        "<blockquote>\n"
+        "📊 <b>Bot Live Statistics</b>\n\n"
+        f"👥 <b>Total Users:</b> <code>{total_users}</code>\n"
+        "🟢 <b>Status:</b> <i>Online & Active</i>\n"
+        "⚡ <b>Engine:</b> <i>Python + Kurigram</i>\n"
+        "</blockquote>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Updates Channel 📢", url=config.CHANNEL_URL),
+                InlineKeyboardButton("Developer 👨‍💻", url=config.DEV_URL),
+            ]
+        ]),
+    )
+
+
+async def cb_stats(_, cb: CallbackQuery):
+    await cb.answer()
+    total_users = await mongodb.get_total_users()
+    await cb.message.reply_text(
+        "<blockquote>\n"
+        "📊 <b>Bot Live Statistics</b>\n\n"
+        f"👥 <b>Total Users:</b> <code>{total_users}</code>\n"
+        "🟢 <b>Status:</b> <i>Online & Active</i>\n"
+        "⚡ <b>Engine:</b> <i>Python + Kurigram</i>\n"
+        "</blockquote>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -381,6 +423,7 @@ async def cmd_help(bot: Client, msg: Message):
         "3. The bot will automatically fetch, process, and send your audio!\n\n"
         "<b>Available Commands:</b>\n"
         "• /start - Start the bot\n"
+        "• /stats - View total users & stats\n"
         "• /help - Show this guide\n"
         "• /ping - Check latency & response speed\n"
         "• /credits - Developer & channel information\n"
@@ -446,6 +489,13 @@ async def cb_help(_, cb: CallbackQuery):
 
 async def handle_message(bot: Client, msg: Message):
     text = msg.text.strip()
+    user = msg.from_user
+
+    # Keep track of active users
+    try:
+        await mongodb.add_user(user.id, user.first_name, user.username, user.dc_id)
+    except Exception:
+        pass
 
     resolved = resolve_spotify_url(text)
     if not resolved:
@@ -456,7 +506,6 @@ async def handle_message(bot: Client, msg: Message):
         return
 
     stype, url, sid = resolved
-    user = msg.from_user
 
     # ── single track ──────────────────────────────────────────────────────────
     if stype == "track":
@@ -512,7 +561,8 @@ async def handle_message(bot: Client, msg: Message):
 
         loop = asyncio.get_running_loop()
         try:
-            forms, fallback_thumb = await loop.run_in_executor(None, _fetch_playlist_forms, url)
+            # Retain the exact session that loaded the forms to preserve cookies and CSRF tokens
+            session, forms, fallback_thumb = await loop.run_in_executor(None, _fetch_playlist_forms, url)
         except Exception as e:
             await status.edit_text(
                 f"<blockquote>❌ <b>Error fetching {stype}:</b>\n\n<code>{e}</code></blockquote>",
@@ -553,8 +603,9 @@ async def handle_message(bot: Client, msg: Message):
             local_path = None
             thumb_path = None
             try:
+                # Pass session to reuse token
                 name, title, artist, local_path, thumb_path, err = await loop.run_in_executor(
-                    None, _download_track_from_form, form, index, fallback_thumb
+                    None, _download_track_from_form, session, form, index, fallback_thumb
                 )
                 if err or not local_path:
                     print(f"[playlist] track {index} skipped: {err}")
@@ -708,18 +759,20 @@ async def main():
 
     # Command handlers
     bot.add_handler(MessageHandler(cmd_start, filters.command("start") & filters.private))
+    bot.add_handler(MessageHandler(cmd_stats, filters.command(["stats", "stat"]) & filters.private))
     bot.add_handler(MessageHandler(cmd_help, filters.command("help") & filters.private))
     bot.add_handler(MessageHandler(cmd_ping, filters.command("ping") & filters.private))
     bot.add_handler(MessageHandler(cmd_credits, filters.command("credits") & filters.private))
 
     # Callback query handlers
+    bot.add_handler(CallbackQueryHandler(cb_stats, filters.regex("^stats$")))
     bot.add_handler(CallbackQueryHandler(cb_credits, filters.regex("^credits$")))
     bot.add_handler(CallbackQueryHandler(cb_help, filters.regex("^help$")))
 
     # Message handler
     bot.add_handler(MessageHandler(
         handle_message,
-        filters.text & filters.private & ~filters.command(["start", "help", "ping", "credits"])
+        filters.text & filters.private & ~filters.command(["start", "stats", "stat", "help", "ping", "credits"])
     ))
 
     await mongodb.connect()
@@ -729,6 +782,7 @@ async def main():
     try:
         await bot.set_bot_commands([
             BotCommand("start", "Start the bot & main menu"),
+            BotCommand("stats", "View bot statistics & user count"),
             BotCommand("help", "How to use this bot"),
             BotCommand("ping", "Check latency & status"),
             BotCommand("credits", "Developer & channel info"),
