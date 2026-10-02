@@ -289,24 +289,71 @@ def fetch_episode_meta(episode_id: str):
         r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         script = soup.find("script", id="__NEXT_DATA__")
-        if not script:
-            return None
-        data = json.loads(script.string)
-        entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
-        title = entity.get("name")
-        show = entity.get("subtitle") or ""
-        images = entity.get("visualIdentity", {}).get("image", [])
-        thumb = images[0].get("url") if images else None
-        preview_url = entity.get("audioPreview", {}).get("url")
-        return {
-            "title": title,
-            "show": show,
-            "thumb": thumb,
-            "preview_url": preview_url
-        }
+        if script and script.string:
+            data = json.loads(script.string)
+            state_data = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {})
+            if isinstance(state_data, dict):
+                entity = state_data.get("entity") or {}
+                if isinstance(entity, dict):
+                    title = entity.get("name") or entity.get("title")
+                    show = entity.get("subtitle") or ""
+                    images = entity.get("visualIdentity", {}).get("image", []) if isinstance(entity.get("visualIdentity"), dict) else []
+                    thumb = images[0].get("url") if images and isinstance(images[0], dict) else None
+                    preview_url = entity.get("audioPreview", {}).get("url") if isinstance(entity.get("audioPreview"), dict) else None
+                    if title:
+                        return {
+                            "title": title,
+                            "show": show,
+                            "thumb": thumb,
+                            "preview_url": preview_url
+                        }
     except Exception as e:
-        print(f"[podcast meta error] {e}")
-        return None
+        print(f"[podcast embed meta error] {e}")
+
+    # Fallback 1: Spotify OEmbed API
+    try:
+        oembed_url = f"https://open.spotify.com/oembed?url=https://open.spotify.com/episode/{episode_id}"
+        r = requests.get(oembed_url, headers={"User-Agent": UA}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            title = data.get("title")
+            if title:
+                return {
+                    "title": title,
+                    "show": "Podcast",
+                    "thumb": None,
+                    "preview_url": None
+                }
+    except Exception as e:
+        print(f"[podcast oembed meta error] {e}")
+
+    # Fallback 2: OpenGraph scraping from Spotify episode page
+    try:
+        page_url = f"https://open.spotify.com/episode/{episode_id}"
+        r = requests.get(page_url, headers={"User-Agent": UA}, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            og_title = soup.find("meta", {"property": "og:title"})
+            og_desc = soup.find("meta", {"property": "og:description"})
+            og_img = soup.find("meta", {"property": "og:image"})
+
+            title = og_title["content"] if og_title and og_title.get("content") else None
+            desc = og_desc["content"] if og_desc and og_desc.get("content") else ""
+            show = desc.replace("· Episode", "").replace("• Episode", "").strip() if desc else "Podcast"
+            thumb = og_img["content"] if og_img and og_img.get("content") else None
+
+            if title:
+                return {
+                    "title": title,
+                    "show": show,
+                    "thumb": thumb,
+                    "preview_url": None
+                }
+    except Exception as e:
+        print(f"[podcast og meta error] {e}")
+
+    return None
+
 
 
 def find_podcast_audio(title: str, show: str = ""):
